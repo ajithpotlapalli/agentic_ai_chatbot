@@ -4,6 +4,7 @@ langchain==0.3.14
 langchain-core==0.3.29
 langchain-openai==0.2.14
 langchain-community==0.3.14
+openai>=1.0.0
 grandalf==0.8
 pandas==2.2.2
 numpy==2.0.2
