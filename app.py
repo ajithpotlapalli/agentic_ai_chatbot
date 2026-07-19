@@ -1,17 +1,43 @@
 
-import streamlit as st
-import sqlite3
-import pandas as pd
+import os
 import json
 import re
-import os
-from datetime import date
-from typing import TypedDict, List, Dict, Any
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, TypedDict
 
-from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+import pandas as pd
+import streamlit as st
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+
+def load_config() -> Dict[str, str]:
+    base_dir = Path(__file__).resolve().parent
+    candidate_files = [base_dir / "config.json", base_dir / "config.example.json"]
+
+    for file_path in candidate_files:
+        if file_path.exists():
+            with file_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+
+    return {}
+
+
+CONFIG = load_config()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or CONFIG.get("OPENAI_API_KEY")
+OPENAI_API_BASE = (
+    os.getenv("OPENAI_BASE_URL")
+    or os.getenv("OPENAI_API_BASE")
+    or CONFIG.get("OPENAI_API_BASE")
+)
+
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+if OPENAI_API_BASE:
+    os.environ["OPENAI_BASE_URL"] = OPENAI_API_BASE
+
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -21,24 +47,16 @@ st.set_page_config(
 )
 
 
-# Load the JSON file and extract values
-file_name = 'config.json'
-with open(file_name, 'r') as file:
-    config = json.load(file)
-    OPENAI_API_KEY = config.get("OPENAI_API_KEY") # Loading the API Key
-    OPENAI_API_BASE = config.get("OPENAI_API_BASE") # Loading the API Base Url
-
-
-# Storing API credentials in environment variables
-os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
-os.environ["OPENAI_BASE_URL"] = OPENAI_API_BASE
-
 # ── LLMs ─────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_llms():
-    llm          = ChatOpenAI(model_name="gpt-4o")
-    evaluate_llm = ChatOpenAI(model_name="gpt-4o")
+    if not OPENAI_API_KEY:
+        return None, None
+
+    llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
+    evaluate_llm = ChatOpenAI(model="gpt-4o", api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
     return llm, evaluate_llm
+
 
 llm, evaluate_llm = load_llms()
 
@@ -138,6 +156,9 @@ def extract_json_from_llm(text: str):
 
 # ── Order agent ───────────────────────────────────────────────────────────────
 def order_agent(query: str, order_id: str, history: list) -> tuple:
+    if llm is None:
+        return "", "I’m unable to answer right now because the OpenAI configuration is missing."
+
     llm_with_tools = llm.bind_tools([fetch_order_details])
 
     history_text = ""
@@ -207,6 +228,9 @@ def order_agent_node(state: OrderState):
     }
 
 def intent_node(state: OrderState):
+    if llm is None:
+        return {"intent": "3"}
+
     prompt = f"""You are an intent classifier for customer service queries. Classify the user's query into one of these categories.
 Return ONLY the numeric ID (0, 1, 2, or 3). No explanation.
 
@@ -239,6 +263,9 @@ def exit_node(state: OrderState):
     return {"final_response": mapping.get(state["intent"], "")}
 
 def evaluation_node(state: OrderState):
+    if evaluate_llm is None:
+        return {"evaluation": {"groundedness": 0.0, "precision": 0.0}}
+
     prompt = f"""Evaluate the assistant's response to a customer query using the provided order context.
 
 Context: {state['order_context']}
@@ -288,6 +315,9 @@ def retry_router(state: OrderState):
     return "safety_check"
 
 def guard_node(state: OrderState):
+    if evaluate_llm is None:
+        return {"guard_result": "SAFE"}
+
     prompt = f"""You are a content safety assistant. Your task is to classify if the assistant's response is appropriate.
 If the message contains:
 - Requests for bank details, OTPs, account numbers
@@ -310,6 +340,9 @@ def guard_router(state: OrderState):
     return "exit" if state.get("guard_result") == "BLOCK" else "memory_save"
 
 def conversational_guard_node(state: OrderState):
+    if evaluate_llm is None:
+        return {"conv_guard_result": "SAFE"}
+
     prompt = f"""You are a conversation monitor AI. Review the conversation and detect if the assistant:
 - Repeatedly gives the same advice to multiple questions
 - Offers solutions the user did not ask for
@@ -367,21 +400,7 @@ def build_graph():
     g.add_edge("exit_node", END)
     return g.compile()
 
-order_graph = build_graph()
-
-# ── Session state defaults ────────────────────────────────────────────────────
-if "conversation_memory" not in st.session_state:
-    st.session_state.conversation_memory = ConversationMemory()
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-if "chat_active" not in st.session_state:
-    st.session_state.chat_active = False
-if "cust_id" not in st.session_state:
-    st.session_state.cust_id = ""
-if "order_id" not in st.session_state:
-    st.session_state.order_id = ""
-if "orders_df" not in st.session_state:
-    st.session_state.orders_df = None
+order_graph = build_graph() if llm is not None and evaluate_llm is not None else None
 
 # ── Helper: fetch customer orders ─────────────────────────────────────────────
 def fetch_customer_orders(cust_id: str) -> pd.DataFrame | None:
@@ -417,186 +436,201 @@ def run_turn(query: str, cust_id: str, order_id: str) -> str:
     # (memory_node uses st.session_state.conversation_memory directly)
     return result.get("final_response", "I'm sorry, I couldn't process that request.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UI
-# ══════════════════════════════════════════════════════════════════════════════
+def main() -> None:
+    # ── Session state defaults ────────────────────────────────────────────────────
+    if "conversation_memory" not in st.session_state:
+        st.session_state.conversation_memory = ConversationMemory()
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+    if "chat_active" not in st.session_state:
+        st.session_state.chat_active = False
+    if "cust_id" not in st.session_state:
+        st.session_state.cust_id = ""
+    if "order_id" not in st.session_state:
+        st.session_state.order_id = ""
+    if "orders_df" not in st.session_state:
+        st.session_state.orders_df = None
 
-st.markdown(
-    """
-    <style>
-    .block-container { max-width: 720px; }
-    .chat-bubble-user {
-        background: #e8f4fd;
-        border-radius: 12px 12px 2px 12px;
-        padding: 10px 14px;
-        margin: 4px 0;
-        max-width: 85%;
-        margin-left: auto;
-        color: #1a1a2e;
-    }
-    .chat-bubble-bot {
-        background: #f4f4f4;
-        border-radius: 12px 12px 12px 2px;
-        padding: 10px 14px;
-        margin: 4px 0;
-        max-width: 85%;
-        color: #1a1a2e;
-    }
-    .order-badge {
-        display: inline-block;
-        background: #fff3cd;
-        border: 1px solid #ffc107;
-        border-radius: 6px;
-        padding: 2px 8px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #856404;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ── Header ────────────────────────────────────────────────────────────────────
-col_logo, col_title = st.columns([1, 6])
-with col_logo:
-    st.markdown("## 🛒")
-with col_title:
-    st.markdown("## Kartify Customer Support")
-    st.caption("AI-powered order query assistant")
-
-st.divider()
-
-# ── Phase 1: Customer ID lookup ───────────────────────────────────────────────
-if not st.session_state.chat_active:
-    st.markdown("### Step 1 — Enter your Customer ID")
-
-    with st.form("customer_form"):
-        cust_input = st.text_input(
-            "Customer ID",
-            placeholder="e.g. C1010",
-            value=st.session_state.cust_id,
-        )
-        submitted = st.form_submit_button("🔍  Fetch Orders", use_container_width=True)
-
-    if submitted and cust_input.strip():
-        with st.spinner("Looking up your orders…"):
-            df = fetch_customer_orders(cust_input.strip())
-        if df is not None:
-            st.session_state.cust_id  = cust_input.strip()
-            st.session_state.orders_df = df
-        else:
-            st.error(f"No orders found for Customer ID **{cust_input.strip()}**. Please check and try again.")
-
-    # ── Phase 2: Order selection ──────────────────────────────────────────────
-    if st.session_state.orders_df is not None:
-        st.markdown("### Step 2 — Select an Order")
-
-        df = st.session_state.orders_df
-
-        # Build display labels for the dropdown
-        options = {
-            f"{row['order_id']} - {row['product_description'][:45]}  [{row['order_status']}]": row["order_id"]
-            for _, row in df.iterrows()
+    st.markdown(
+        """
+        <style>
+        .block-container { max-width: 720px; }
+        .chat-bubble-user {
+            background: #e8f4fd;
+            border-radius: 12px 12px 2px 12px;
+            padding: 10px 14px;
+            margin: 4px 0;
+            max-width: 85%;
+            margin-left: auto;
+            color: #1a1a2e;
         }
+        .chat-bubble-bot {
+            background: #f4f4f4;
+            border-radius: 12px 12px 12px 2px;
+            padding: 10px 14px;
+            margin: 4px 0;
+            max-width: 85%;
+            color: #1a1a2e;
+        }
+        .order-badge {
+            display: inline-block;
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 6px;
+            padding: 2px 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #856404;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        selected_label = st.selectbox(
-            "Your orders",
-            list(options.keys()),
-            index=0,
-        )
-        selected_order_id = options[selected_label]
+    # ── Header ────────────────────────────────────────────────────────────────────
+    col_logo, col_title = st.columns([1, 6])
+    with col_logo:
+        st.markdown("## 🛒")
+    with col_title:
+        st.markdown("## Kartify Customer Support")
+        st.caption("AI-powered order query assistant")
 
-        # Preview card
-        selected_row = df[df["order_id"] == selected_order_id].iloc[0]
-        st.markdown(
-            f"""
-            <div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:12px 16px;margin:8px 0">
-                <span class="order-badge">{selected_row['order_id']}</span>&nbsp;&nbsp;
-                <strong>{selected_row['product_description']}</strong><br>
-                <span style="font-size:0.85rem;color:#6c757d">Status: {selected_row['order_status']}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    st.divider()
 
-        if st.button("💬  Start Chat", use_container_width=True, type="primary"):
-            st.session_state.order_id = selected_order_id
-            st.session_state.chat_active = True
-            st.session_state.conversation_memory.clear()
-            st.session_state.chat_messages = []
-            # Greeting
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": (
-                    f"Hi! I'm your Kartify support assistant. "
-                    f"I can see you're asking about order **{selected_order_id}**. "
-                    f"How can I help you today?"
-                ),
-            })
-            st.rerun()
+    # ── Phase 1: Customer ID lookup ───────────────────────────────────────────────
+    if not st.session_state.chat_active:
+        st.markdown("### Step 1 — Enter your Customer ID")
 
-# ── Phase 3: Chat interface ───────────────────────────────────────────────────
-else:
-    # Sidebar info
-    with st.sidebar:
-        st.markdown("### Active Session")
-        st.markdown(f"**Customer:** `{st.session_state.cust_id}`")
-        st.markdown(f"**Order:** `{st.session_state.order_id}`")
-        st.divider()
-        if st.button("🔄  New Session", use_container_width=True):
-            st.session_state.chat_active = False
-            st.session_state.chat_messages = []
-            st.session_state.conversation_memory.clear()
-            st.session_state.orders_df = None
-            st.session_state.cust_id = ""
-            st.session_state.order_id = ""
-            st.rerun()
-        st.divider()
-        st.caption(
-            "Powered by LangGraph · GPT-4o-mini\n\n"
-            "Guardrails: Input intent · Output safety · Conversation monitor"
-        )
+        with st.form("customer_form"):
+            cust_input = st.text_input(
+                "Customer ID",
+                placeholder="e.g. C1010",
+                value=st.session_state.cust_id,
+            )
+            submitted = st.form_submit_button("🔍  Fetch Orders", use_container_width=True)
 
-    st.markdown(f"**Order** `{st.session_state.order_id}` — ask me anything about this order.")
-    st.markdown("")
+        if submitted and cust_input.strip():
+            with st.spinner("Looking up your orders…"):
+                df = fetch_customer_orders(cust_input.strip())
+            if df is not None:
+                st.session_state.cust_id = cust_input.strip()
+                st.session_state.orders_df = df
+            else:
+                st.error(f"No orders found for Customer ID **{cust_input.strip()}**. Please check and try again.")
 
-    # Render chat history
-    for msg in st.session_state.chat_messages:
-        if msg["role"] == "user":
+        # ── Phase 2: Order selection ──────────────────────────────────────────────
+        if st.session_state.orders_df is not None:
+            st.markdown("### Step 2 — Select an Order")
+
+            df = st.session_state.orders_df
+
+            # Build display labels for the dropdown
+            options = {
+                f"{row['order_id']} - {row['product_description'][:45]}  [{row['order_status']}]": row["order_id"]
+                for _, row in df.iterrows()
+            }
+
+            selected_label = st.selectbox(
+                "Your orders",
+                list(options.keys()),
+                index=0,
+            )
+            selected_order_id = options[selected_label]
+
+            # Preview card
+            selected_row = df[df["order_id"] == selected_order_id].iloc[0]
+            st.markdown(
+                f"""
+                <div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:12px 16px;margin:8px 0">
+                    <span class="order-badge">{selected_row['order_id']}</span>&nbsp;&nbsp;
+                    <strong>{selected_row['product_description']}</strong><br>
+                    <span style="font-size:0.85rem;color:#6c757d">Status: {selected_row['order_status']}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if st.button("💬  Start Chat", use_container_width=True, type="primary"):
+                st.session_state.order_id = selected_order_id
+                st.session_state.chat_active = True
+                st.session_state.conversation_memory.clear()
+                st.session_state.chat_messages = []
+                # Greeting
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": (
+                        f"Hi! I'm your Kartify support assistant. "
+                        f"I can see you're asking about order **{selected_order_id}**. "
+                        f"How can I help you today?"
+                    ),
+                })
+                st.rerun()
+
+    # ── Phase 3: Chat interface ───────────────────────────────────────────────────
+    else:
+        # Sidebar info
+        with st.sidebar:
+            st.markdown("### Active Session")
+            st.markdown(f"**Customer:** `{st.session_state.cust_id}`")
+            st.markdown(f"**Order:** `{st.session_state.order_id}`")
+            st.divider()
+            if st.button("🔄  New Session", use_container_width=True):
+                st.session_state.chat_active = False
+                st.session_state.chat_messages = []
+                st.session_state.conversation_memory.clear()
+                st.session_state.orders_df = None
+                st.session_state.cust_id = ""
+                st.session_state.order_id = ""
+                st.rerun()
+            st.divider()
+            st.caption(
+                "Powered by LangGraph · GPT-4o-mini\n\n"
+                "Guardrails: Input intent · Output safety · Conversation monitor"
+            )
+
+        st.markdown(f"**Order** `{st.session_state.order_id}` — ask me anything about this order.")
+        st.markdown("")
+
+        # Render chat history
+        for msg in st.session_state.chat_messages:
+            if msg["role"] == "user":
+                with st.chat_message("user"):
+                    st.markdown(msg["content"])
+            else:
+                with st.chat_message("assistant", avatar="🛒"):
+                    st.markdown(msg["content"])
+
+        # Chat input
+        user_query = st.chat_input("Type your question here…")
+
+        if user_query:
+            # Display user message
+            st.session_state.chat_messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
-                st.markdown(msg["content"])
-        else:
+                st.markdown(user_query)
+
+            # Run agent
             with st.chat_message("assistant", avatar="🛒"):
-                st.markdown(msg["content"])
+                with st.spinner("Thinking…"):
+                    response = run_turn(
+                        query=user_query,
+                        cust_id=st.session_state.cust_id,
+                        order_id=st.session_state.order_id,
+                    )
+                st.markdown(response)
 
-    # Chat input
-    user_query = st.chat_input("Type your question here…")
+            st.session_state.chat_messages.append({"role": "assistant", "content": response})
 
-    if user_query:
-        # Display user message
-        st.session_state.chat_messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
+            # If the agent exits (intent 0/1/3), offer to restart
+            exit_phrases = [
+                "human support agent",
+                "customer support specialist",
+                "I hope I was able to assist",
+                "only able to help with information",
+            ]
+            if any(p.lower() in response.lower() for p in exit_phrases):
+                st.info("This conversation has ended. Use **New Session** in the sidebar to start over.")
 
-        # Run agent
-        with st.chat_message("assistant", avatar="🛒"):
-            with st.spinner("Thinking…"):
-                response = run_turn(
-                    query=user_query,
-                    cust_id=st.session_state.cust_id,
-                    order_id=st.session_state.order_id,
-                )
-            st.markdown(response)
 
-        st.session_state.chat_messages.append({"role": "assistant", "content": response})
-
-        # If the agent exits (intent 0/1/3), offer to restart
-        exit_phrases = [
-            "human support agent",
-            "customer support specialist",
-            "I hope I was able to assist",
-            "only able to help with information",
-        ]
-        if any(p.lower() in response.lower() for p in exit_phrases):
-            st.info("This conversation has ended. Use **New Session** in the sidebar to start over.")
+if __name__ == "__main__":
+    main()
