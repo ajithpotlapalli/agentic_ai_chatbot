@@ -564,10 +564,10 @@ def main() -> None:
 
             df = st.session_state.orders_df
 
-            # Build display labels for the dropdown
+            # Build display labels for the dropdown (df is a list of dicts)
             options = {
                 f"{row['order_id']} - {row['product_description'][:45]}  [{row['order_status']}]": row["order_id"]
-                for _, row in df.iterrows()
+                for row in df
             }
 
             selected_label = st.selectbox(
@@ -578,7 +578,11 @@ def main() -> None:
             selected_order_id = options[selected_label]
 
             # Preview card
-            selected_row = df[df["order_id"] == selected_order_id].iloc[0]
+            # Find the selected row dict by order_id
+            selected_row = next((r for r in df if r.get("order_id") == selected_order_id), None)
+            if selected_row is None:
+                st.error("Selected order not found. Please refresh and try again.")
+                st.stop()
             st.markdown(
                 f"""
                 <div style="background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:12px 16px;margin:8px 0">
