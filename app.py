@@ -471,6 +471,12 @@ def run_turn(query: str, cust_id: str, order_id: str) -> str:
         "conv_guard_result": "",
         "retry_count": 0,
     }
+    if order_graph is None:
+        return (
+            "Assistant unavailable: LLM or runtime graph is not configured. "
+            "Please set `OPENAI_API_KEY` and ensure required packages are installed."
+        )
+
     result = order_graph.invoke(state, config={"recursion_limit": 100})
     # Sync memory from the graph's memory_node writes
     # (memory_node uses st.session_state.conversation_memory directly)
@@ -490,6 +496,18 @@ def main() -> None:
         st.session_state.order_id = ""
     if "orders_df" not in st.session_state:
         st.session_state.orders_df = None
+
+    # Try to initialize LLMs and the order graph at runtime when Streamlit is active
+    global llm, evaluate_llm, order_graph
+    try:
+        if llm is None and ChatOpenAI is not None and OPENAI_API_KEY:
+            llm, evaluate_llm = load_llms()
+
+        if order_graph is None and llm is not None and evaluate_llm is not None:
+            order_graph = build_graph()
+    except Exception:
+        # Initialization errors will be surfaced when the user tries to use the assistant
+        pass
 
     st.markdown(
         """
